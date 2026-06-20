@@ -251,6 +251,9 @@ def rank_pitchers(df, team_runs):
             "OppG": gates["opp"], "Qual": gates["qual"], "Wx": gates["wx"], "Win": gates["win"],
             "why": why,
         })
+    if not rows:
+        return pd.DataFrame(columns=["Pitcher", "Tm", "OppTeam", "OppRuns", "Sal", "RW",
+                                     "SCORE", "Val", "OppG", "Qual", "Wx", "Win", "why"])
     return pd.DataFrame(rows).sort_values("SCORE", ascending=False).reset_index(drop=True)
 
 
@@ -275,6 +278,9 @@ def rank_bats(df, team_runs, allow_7th=False):
             "L7": num(r.get("L7 FPTS")), "AVG": num(r.get("AVG")),
             "SCORE": sc, "flag": flag, "why": why,
         })
+    if not rows:
+        return pd.DataFrame(columns=["Player", "Tm", "Pos", "Slot", "Sal", "RW",
+                                     "L7", "AVG", "SCORE", "flag", "why"])
     return pd.DataFrame(rows).sort_values("SCORE", ascending=False).reset_index(drop=True)
 
 
