@@ -228,11 +228,11 @@ def rank_pitchers(df, team_runs):
         comp, gates, why, opp_runs = pitcher_gates(r, team_runs)
         sal = num(r.get("SAL"), 0)
         rows.append({
-            "Pitcher": r.get("PLAYER"), "Tm": r.get("TEAM"), "Opp": r.get("OPP"),
+            "Pitcher": r.get("PLAYER"), "Tm": r.get("TEAM"), "OppTeam": r.get("OPP"),
             "OppRuns": opp_runs, "Sal": int(sal) if sal else None,
             "RW": num(r.get("FPTS"), 0), "SCORE": comp,
             "Val": round(comp / (sal / 1000), 2) if sal else 0,
-            "Opp": gates["opp"], "Qual": gates["qual"], "Wx": gates["wx"], "Win": gates["win"],
+            "OppG": gates["opp"], "Qual": gates["qual"], "Wx": gates["wx"], "Win": gates["win"],
             "why": why,
         })
     return pd.DataFrame(rows).sort_values("SCORE", ascending=False).reset_index(drop=True)
@@ -364,8 +364,8 @@ br = rank_bats(raw, team_runs, allow_7th=allow_7th)
 
 # ---- pitcher board ----
 st.subheader("Pitchers — ranked by your gates")
-st.dataframe(pr[["Pitcher", "Tm", "Opp", "OppRuns", "Sal", "RW", "SCORE", "Val",
-                 "Opp", "Qual", "Wx", "Win"]].rename(columns={"Opp": "OppG"}),
+st.dataframe(pr[["Pitcher", "Tm", "OppTeam", "OppRuns", "Sal", "RW", "SCORE", "Val",
+                 "OppG", "Qual", "Wx", "Win"]],
              use_container_width=True, hide_index=True)
 
 with st.expander("Why each pitcher ranks where it does"):
