@@ -257,6 +257,9 @@ def rank_pitchers(df, team_runs):
 def rank_bats(df, team_runs, allow_7th=False):
     rows = []
     for _, r in df.iterrows():
+        # exclude pitchers — they belong only in the pitcher board
+        if str(r.get("POS", "")).strip() == "P" or str(r.get("LINEUP", "")).strip() == "SP":
+            continue
         slot = str(r.get("LINEUP", "")).strip()
         if slot == "BN":
             continue
@@ -399,7 +402,9 @@ br = rank_bats(raw, team_runs, allow_7th=allow_7th)
 
 # ---- pitcher board ----
 st.subheader("Pitchers — ranked by your gates")
-st.dataframe(pr[["Pitcher", "Tm", "OppTeam", "OppRuns", "Sal", "RW", "SCORE", "Val",
+pr_show = pr.copy()
+pr_show["Tier"] = pr_show["Sal"].apply(lambda s: tier(s, PITCHER_STUD, PITCHER_VALUE))
+st.dataframe(pr_show[["Pitcher", "Tm", "OppTeam", "OppRuns", "Sal", "Tier", "RW", "SCORE", "Val",
                  "OppG", "Qual", "Wx", "Win"]],
              use_container_width=True, hide_index=True)
 
@@ -409,32 +414,42 @@ with st.expander("Why each pitcher ranks where it does"):
                  f"Opp: {r['why']['opp']} · Qual: {r['why']['qual']} · "
                  f"Wx: {r['why']['wx']} · Win: {r['why']['win']}")
 
-# ---- three constructions (using your salary tiers) ----
-st.subheader("Three pitcher constructions")
-stud_pool = pr[pr["Sal"] >= PITCHER_STUD].sort_values("SCORE", ascending=False)
-value_pool = pr[pr["Sal"] < PITCHER_VALUE].sort_values("SCORE", ascending=False)
-# fallbacks if a tier is thin on a given slate
+# ---- pitcher tier combos (all six, including two-mid) ----
+st.subheader("Pitcher constructions (by your salary tiers)")
+stud_pool = pr[pr["Sal"] >= PITCHER_STUD].sort_values("SCORE", ascending=False)["Pitcher"].tolist()
+mid_pool = pr[(pr["Sal"] >= PITCHER_VALUE) & (pr["Sal"] < PITCHER_STUD)].sort_values("SCORE", ascending=False)["Pitcher"].tolist()
+value_pool = pr[pr["Sal"] < PITCHER_VALUE].sort_values("SCORE", ascending=False)["Pitcher"].tolist()
 top2 = pr.head(2)["Pitcher"].tolist()
-two_studs = stud_pool["Pitcher"].head(2).tolist()
-if len(two_studs) < 2:
-    two_studs = top2
-stud_plus_value = (stud_pool["Pitcher"].head(1).tolist()
-                   + value_pool["Pitcher"].head(1).tolist())
-if len(stud_plus_value) < 2:
-    stud_plus_value = top2
-two_value = value_pool["Pitcher"].head(2).tolist()
-if len(two_value) < 2:
-    two_value = pr.sort_values("Sal")["Pitcher"].head(2).tolist()
 
-constructions = {
-    "A) Two studs (≥$9k)": two_studs,
-    "B) Stud + value": stud_plus_value,
-    "C) Two value (<$7k)": two_value,
+
+def pick(pool_a, pool_b, same=False):
+    """Best from pool_a + best from pool_b; if same pool, take top 2."""
+    if same:
+        return pool_a[:2] if len(pool_a) >= 2 else None
+    if pool_a and pool_b:
+        return [pool_a[0], pool_b[0]]
+    return None
+
+
+raw_constructions = {
+    "A) Two studs (≥$9k)": pick(stud_pool, stud_pool, same=True),
+    "B) Stud + mid": pick(stud_pool, mid_pool),
+    "C) Stud + value": pick(stud_pool, value_pool),
+    "D) Two mid ($7–8.9k)": pick(mid_pool, mid_pool, same=True),
+    "E) Mid + value": pick(mid_pool, value_pool),
+    "F) Two value (<$7k)": pick(value_pool, value_pool, same=True),
 }
+# keep only constructions the slate can actually fill; fall back to top2 if none
+constructions = {k: v for k, v in raw_constructions.items() if v and len(v) == 2}
+if not constructions:
+    constructions = {"Top 2 by score": top2}
 choice = st.radio("Pick a pitcher construction to build around:",
-                  list(constructions.keys()), index=1)
+                  list(constructions.keys()),
+                  index=min(1, len(constructions) - 1))
 forced = constructions[choice]
 st.write(f"Locking pitchers: **{', '.join(forced)}**")
+st.caption("Tiers: Stud ≥$9k · Mid $7–8.9k · Value <$7k. Combos with no available arms "
+           "on this slate are hidden.")
 
 # ---- bats board ----
 st.subheader("Bats — form leads, team total amplifies, cold bats capped")
