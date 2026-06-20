@@ -81,7 +81,23 @@ SALARY_CAP = 50000
 MAX_HITTERS_PER_TEAM = 3
 CLOSE_CALL_PTS = 4.0
 
+# Salary tiers (Mike's numbers). stud >= STUD, value < VALUE, mid in between.
+PITCHER_STUD = 9000
+PITCHER_VALUE = 7000
+BAT_STUD = 5000
+BAT_VALUE = 3500
+
 DK_SLOTS = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
+
+
+def tier(sal, stud, value):
+    if sal is None:
+        return "?"
+    if sal >= stud:
+        return "Stud"
+    if sal < value:
+        return "Value"
+    return "Mid"
 
 st.set_page_config(page_title="MPH Lineup Builder", layout="wide")
 
@@ -270,20 +286,23 @@ def adjusted_proj(rw_fpts, gate_score):
     return round(rw_fpts * mult, 2)
 
 
-def build_lineup(pitchers_df, bats_df, forced_pitchers=None):
+def build_lineup(pitchers_df, bats_df, forced_pitchers=None, locked_players=None):
     """MILP: pick 2 P + C/1B/2B/3B/SS + 3 OF under cap, max adjusted proj.
-    forced_pitchers: list of pitcher names to lock (for the 3 constructions)."""
+    forced_pitchers: pitcher names to lock (the 3 constructions).
+    locked_players: any player names the user wants locked (lock-favorites)."""
     if not HAS_PULP:
         return None, "pulp not installed"
 
-    # build player universe
+    # build player universe (carry batting order 'bo' and gate 'score' for display)
     players = []
     for _, r in pitchers_df.iterrows():
         players.append({"name": r["Pitcher"], "team": r["Tm"], "sal": r["Sal"] or 99999,
-                        "proj": adjusted_proj(r["RW"], r["SCORE"]), "pos": ["P"]})
+                        "proj": adjusted_proj(r["RW"], r["SCORE"]), "pos": ["P"],
+                        "bo": "SP", "score": r["SCORE"]})
     for _, r in bats_df.iterrows():
         players.append({"name": r["Player"], "team": r["Tm"], "sal": r["Sal"] or 99999,
-                        "proj": adjusted_proj(r["RW"], r["SCORE"]), "pos": positions_of(r["Pos"])})
+                        "proj": adjusted_proj(r["RW"], r["SCORE"]), "pos": positions_of(r["Pos"]),
+                        "bo": r["Slot"], "score": r["SCORE"]})
 
     prob = pulp.LpProblem("lineup", pulp.LpMaximize)
     # decision var per (player, eligible-slot)
@@ -301,7 +320,6 @@ def build_lineup(pitchers_df, bats_df, forced_pitchers=None):
         prob += pulp.lpSum(x[(i, s)] for (i, s) in x if s == slot) == cnt
     # each player at most once
     for i in range(len(players)):
-        vs = [x[(i, s)] for (i, s) in x if s == "P" or True if (i, s) in x]
         own = [x[(i, s)] for (j, s) in x if j == i]
         if own:
             prob += pulp.lpSum(own) <= 1
@@ -312,14 +330,31 @@ def build_lineup(pitchers_df, bats_df, forced_pitchers=None):
     for tm in teams:
         prob += pulp.lpSum(x[(i, s)] for (i, s) in x
                            if players[i]["team"] == tm and s != "P") <= MAX_HITTERS_PER_TEAM
-    # forced pitchers
-    if forced_pitchers:
-        for fp in forced_pitchers:
+
+    # forced pitchers (from construction choice) — but locked pitchers take priority
+    # so we never demand more than 2 pitchers. Locked pitchers fill slots first.
+    locked_set = set(locked_players or [])
+    locked_pitcher_names = [p["name"] for p in players
+                            if p["name"] in locked_set and p["pos"] == ["P"]]
+    n_locked_p = len(locked_pitcher_names)
+    if forced_pitchers and n_locked_p < 2:
+        # only force construction pitchers that aren't already locked, up to 2 total
+        room = 2 - n_locked_p
+        to_force = [fp for fp in forced_pitchers if fp not in locked_set][:room]
+        for fp in to_force:
             idxs = [i for i, p in enumerate(players) if p["name"] == fp]
+            if idxs and (idxs[0], "P") in x:
+                prob += x[(idxs[0], "P")] == 1
+
+    # locked favorites (any player the user checked) — force them into ANY eligible slot
+    if locked_players:
+        for lp in locked_players:
+            idxs = [i for i, p in enumerate(players) if p["name"] == lp]
             if idxs:
                 i = idxs[0]
-                if (i, "P") in x:
-                    prob += x[(i, "P")] == 1
+                slots_for_i = [x[(i, s)] for (j, s) in x if j == i]
+                if slots_for_i:
+                    prob += pulp.lpSum(slots_for_i) == 1
 
     prob.solve(pulp.PULP_CBC_CMD(msg=0))
     if pulp.LpStatus[prob.status] != "Optimal":
@@ -374,19 +409,27 @@ with st.expander("Why each pitcher ranks where it does"):
                  f"Opp: {r['why']['opp']} · Qual: {r['why']['qual']} · "
                  f"Wx: {r['why']['wx']} · Win: {r['why']['win']}")
 
-# ---- three constructions ----
+# ---- three constructions (using your salary tiers) ----
 st.subheader("Three pitcher constructions")
-studs = pr.head(2)["Pitcher"].tolist()
-stud_one = pr.head(1)["Pitcher"].tolist()
-# value = best Val score among cheaper arms (sal <= 7000)
-value_pool = pr[pr["Sal"] <= 7000].sort_values("SCORE", ascending=False)
-value_arms = value_pool["Pitcher"].head(2).tolist()
-stud_plus_value = stud_one + (value_pool["Pitcher"].head(1).tolist())
+stud_pool = pr[pr["Sal"] >= PITCHER_STUD].sort_values("SCORE", ascending=False)
+value_pool = pr[pr["Sal"] < PITCHER_VALUE].sort_values("SCORE", ascending=False)
+# fallbacks if a tier is thin on a given slate
+top2 = pr.head(2)["Pitcher"].tolist()
+two_studs = stud_pool["Pitcher"].head(2).tolist()
+if len(two_studs) < 2:
+    two_studs = top2
+stud_plus_value = (stud_pool["Pitcher"].head(1).tolist()
+                   + value_pool["Pitcher"].head(1).tolist())
+if len(stud_plus_value) < 2:
+    stud_plus_value = top2
+two_value = value_pool["Pitcher"].head(2).tolist()
+if len(two_value) < 2:
+    two_value = pr.sort_values("Sal")["Pitcher"].head(2).tolist()
 
 constructions = {
-    "A) Two studs": studs,
-    "B) Stud + value": stud_plus_value if len(stud_plus_value) == 2 else studs,
-    "C) Two value": value_arms if len(value_arms) == 2 else studs,
+    "A) Two studs (≥$9k)": two_studs,
+    "B) Stud + value": stud_plus_value,
+    "C) Two value (<$7k)": two_value,
 }
 choice = st.radio("Pick a pitcher construction to build around:",
                   list(constructions.keys()), index=1)
@@ -395,26 +438,36 @@ st.write(f"Locking pitchers: **{', '.join(forced)}**")
 
 # ---- bats board ----
 st.subheader("Bats — form leads, team total amplifies, cold bats capped")
-st.dataframe(br[["Player", "Tm", "Pos", "Slot", "Sal", "RW", "L7", "AVG", "SCORE", "flag"]],
+br_show = br.copy()
+br_show["Tier"] = br_show["Sal"].apply(lambda s: tier(s, BAT_STUD, BAT_VALUE))
+st.dataframe(br_show[["Player", "Tm", "Pos", "Slot", "Sal", "Tier", "RW", "L7", "AVG", "SCORE", "flag"]],
              use_container_width=True, hide_index=True)
 st.caption("COLD-CAP = slumping bat held down so a hot team total can't float it up (the .180 fix).")
+
+# ---- LOCK FAVORITES ----
+st.subheader("Lock your favorites (optional)")
+st.caption("Check any players you want in the lineup no matter what — the tool fills the rest around them.")
+all_names = pr["Pitcher"].tolist() + br["Player"].tolist()
+locked = st.multiselect("Locked players:", options=all_names, default=[])
 
 # ---- assemble ----
 st.subheader("Built lineup")
 if not HAS_PULP:
     st.warning("Install `pulp` to enable salary-cap lineup assembly: pip install pulp")
 else:
-    lineup, err = build_lineup(pr, br, forced_pitchers=forced)
+    lineup, err = build_lineup(pr, br, forced_pitchers=forced, locked_players=locked)
     if err:
-        st.error(f"Couldn't build: {err}. Try a different construction or allow the 7th slot.")
+        st.error(f"Couldn't build: {err}. Too many/too-expensive locks, or try a different "
+                 f"construction / allow the 7th slot.")
     else:
         rows = [{"Slot": c["slot"], "Player": c["name"], "Team": c["team"],
-                 "Sal": c["sal"], "AdjProj": c["proj"]} for c in lineup["players"]]
+                 "BatOrd": c["bo"], "Sal": c["sal"], "SCORE": c["score"],
+                 "AdjProj": c["proj"]} for c in lineup["players"]]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         st.write(f"**Salary:** ${lineup['salary']:,} / ${SALARY_CAP:,}  ·  "
                  f"**Adj projection:** {lineup['proj']}")
-        st.caption("AdjProj = RotoWire FPTS nudged ±25% by your gate score. This is the tool's "
-                   "lineup — override any spot freely before entering on DK.")
+        st.caption("BatOrd = batting order (SP for pitchers). SCORE = your gate score. "
+                   "AdjProj = RotoWire FPTS nudged ±25% by gate score. Override any spot before DK.")
 
 st.divider()
 st.caption("Phase 2 (next): wire Baseball Savant (xwOBA, barrel%, opp K%) + Odds API moneyline "
