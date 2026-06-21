@@ -68,6 +68,17 @@ try:
 except Exception:
     HAS_PULP = False
 
+# Savant enrichment (phase 2) — optional; if it fails, gates run CSV-only.
+try:
+    import savant
+    HAS_SAVANT = savant.HAS_PYBASEBALL
+except Exception:
+    HAS_SAVANT = False
+    savant = None
+
+# Toggle so a slow/broken Savant pull can be turned off without redeploying.
+USE_SAVANT = True
+
 # ============================================================
 # TUNABLES
 # ============================================================
@@ -99,7 +110,47 @@ def tier(sal, stud, value):
         return "Value"
     return "Mid"
 
-st.set_page_config(page_title="MPH Lineup Builder", layout="wide")
+st.set_page_config(page_title="MPH Lineup Builder", layout="wide", page_icon="⚾")
+
+# ---- visual theme: focused command console ----
+st.markdown("""
+<style>
+  /* tighten + theme */
+  .block-container {padding-top: 2.2rem; max-width: 1400px;}
+  h1, h2, h3 {font-family: 'DM Sans', 'Inter', -apple-system, sans-serif; letter-spacing: -0.02em;}
+  /* section headers get a left accent bar */
+  div[data-testid="stMarkdownContainer"] h3 {
+      border-left: 3px solid #16a34a; padding-left: 0.6rem; margin-top: 1.4rem;
+  }
+  /* dataframe: denser, monospace numbers */
+  div[data-testid="stDataFrame"] {border: 1px solid #1f2937; border-radius: 8px;}
+  /* the MPH header band */
+  .mph-hero {
+      background: linear-gradient(100deg, #0f172a 0%, #14532d 100%);
+      color: #f8fafc; padding: 1.1rem 1.4rem; border-radius: 12px; margin-bottom: 0.4rem;
+  }
+  .mph-hero h1 {margin: 0; font-size: 1.7rem; color: #f8fafc;}
+  .mph-hero p {margin: 0.2rem 0 0; color: #86efac; font-size: 0.85rem;}
+  .mph-badge {display:inline-block; padding:0.1rem 0.5rem; border-radius:6px;
+      font-size:0.72rem; font-weight:600; margin-left:0.4rem;}
+</style>
+""", unsafe_allow_html=True)
+
+
+def style_scores(df, score_cols):
+    """Color-code 0-100 gate columns green(high)->red(low) for fast scanning."""
+    def color(v):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if v >= 70:
+            return "background-color: #14532d; color: #dcfce7;"
+        if v >= 50:
+            return "background-color: #422006; color: #fde68a;"
+        return "background-color: #450a0a; color: #fecaca;"
+    cols = [c for c in score_cols if c in df.columns]
+    return df.style.map(color, subset=cols)
 
 
 # ============================================================
@@ -156,7 +207,22 @@ def pitcher_gates(r, team_runs):
     opp = str(r.get("OPP", "")).strip()
     opp_runs = team_runs.get(opp)
 
-    g_opp = scale(opp_runs, 2.8, 6.0, inv=True)
+    g_opp_runs = scale(opp_runs, 2.8, 6.0, inv=True)
+
+    # Savant: opponent strikeout rate. High opp K% = better for a pitcher (more whiffs).
+    # This is the COL-whiffs read. If unavailable, gate is just the run-total component.
+    opp_k = None
+    if USE_SAVANT and savant is not None:
+        try:
+            opp_k = savant.opponent_k_pct(opp)
+        except Exception:
+            opp_k = None
+    if opp_k is not None:
+        g_opp_k = scale(opp_k, 18, 28)   # 18% low-whiff offense, 28% high-whiff
+        # blend: 60% run-environment, 40% opponent whiff tendency
+        g_opp = round(g_opp_runs * 0.60 + g_opp_k * 0.40, 1)
+    else:
+        g_opp = g_opp_runs
 
     ip, xfip, kpct = num(r.get("IP")), num(r.get("xFIP")), num(r.get("K%"))
     g_qual = round(scale(ip, 50, 110) * 0.30
@@ -190,8 +256,11 @@ def pitcher_gates(r, team_runs):
                       + g_wx * PITCHER_WEIGHTS["weather"]
                       + g_win * PITCHER_WEIGHTS["winprob"], 1)
 
+    _opp_why = f"opp {opp} implied {opp_runs:.1f} runs" if opp_runs is not None else "opp total n/a"
+    if opp_k is not None:
+        _opp_why += f", opp K% {opp_k:.0f} (Savant)"
     why = {
-        "opp": f"opp {opp} implied {opp_runs:.1f} runs" if opp_runs is not None else "opp total n/a",
+        "opp": _opp_why,
         "qual": ", ".join(b for b in [f"{ip:.0f}IP" if ip else None,
                                        f"{xfip:.2f}xFIP" if xfip else None,
                                        f"{kpct:.0f}%K" if kpct else None] if b),
@@ -229,9 +298,38 @@ def bat_gates(r, team_runs):
     else:
         score = round(indiv * (1 - TEAM_AMP_SHARE) + amp * TEAM_AMP_SHARE, 1)
         flag = ""
+
+    # Savant contact-quality layer: validates whether form is REAL.
+    # High xwOBA/barrel% = quality contact -> small boost (hot streak is earned,
+    # or cold stretch is unlucky and due). Low = fade. Max ±8 pts so it sharpens,
+    # never dominates. Skipped entirely if Savant unavailable.
+    xq_why = ""
+    if USE_SAVANT and savant is not None:
+        try:
+            m = savant.player_metrics(r.get("PLAYER", ""))
+        except Exception:
+            m = {}
+        if m:
+            xwoba = m.get("xwoba")
+            barrel = m.get("barrel")
+            adj = 0.0
+            if xwoba is not None:
+                adj += (scale(xwoba, 0.280, 0.380) - 50) / 50 * 6   # ±6
+                xq_why += f" · xwOBA {xwoba:.3f}"
+            if barrel is not None:
+                adj += (scale(barrel, 4, 14) - 50) / 50 * 4         # ±4
+                xq_why += f" · barrel {barrel:.0f}%"
+            if not cold:   # don't un-cap a cold bat via contact alone
+                score = round(max(0, min(100, score + adj)), 1)
+            if adj >= 3:
+                xq_why += " (contact validates)"
+            elif adj <= -3:
+                xq_why += " (⚠ weak contact)"
+
     why = (f"L7 {l7:.1f}, AVG {avg:.3f}, vHand OPS "
            f"{vops:.3f}, slot {slot}, team {tr:.1f} runs"
            if all(v is not None for v in [l7, avg, vops, tr]) else "partial data")
+    why += xq_why
     return score, indiv, amp, cold, flag, why
 
 
@@ -383,15 +481,38 @@ def build_lineup(pitchers_df, bats_df, forced_pitchers=None, locked_players=None
 # ============================================================
 # UI
 # ============================================================
-st.title("⚾ MPH MLB Lineup Builder")
-st.caption("v1 — your gates on RotoWire's pool. Ranks, builds 3 constructions, you decide. "
-           "Not proven yet — track vs your own picks before trusting it.")
+st.markdown("""
+<div class="mph-hero">
+  <h1>⚾ MPH MLB Lineup Builder</h1>
+  <p>Your gates on RotoWire's pool · ranks, builds, you decide · track before trusting</p>
+</div>
+""", unsafe_allow_html=True)
 
 uploaded = st.file_uploader("Drop the RotoWire player-pool CSV", type=["csv"])
 if uploaded is None:
     st.info("Export the slate from RotoWire (with added columns: Opp ERA, T Runs, IP, "
             "xFIP, K%, GB/FB, vH AVG/OPS) and drop it here.")
     st.stop()
+
+# ---- Savant status (so you SEE whether advanced metrics are live) ----
+with st.expander("Advanced metrics (Baseball Savant) — status", expanded=False):
+    if not HAS_SAVANT:
+        st.warning("pybaseball not installed — running CSV-only. Add `pybaseball` to "
+                   "requirements.txt to enable opponent-K%, xwOBA, barrel%.")
+    elif not USE_SAVANT:
+        st.info("Savant enrichment is toggled OFF in code (USE_SAVANT=False).")
+    else:
+        with st.spinner("Checking Savant connection…"):
+            try:
+                v = savant.verify_savant()
+            except Exception as e:
+                v = {"status": f"error: {e}"}
+        st.write(f"**Status:** {v.get('status')}")
+        if v.get("team_k"):
+            st.write("Sample opponent K%:", v["team_k"])
+        st.caption("If status is LIVE, gates use opponent-K% and xwOBA/barrel%. "
+                   "If it fell back, the tool still works on CSV data only — nothing breaks, "
+                   "just no advanced sharpening. First run is slow (downloads season data).")
 
 raw = pd.read_csv(uploaded)
 team_runs = build_team_runs(raw)
@@ -406,12 +527,22 @@ if pitchers_raw.empty:
 pr = rank_pitchers(pitchers_raw, team_runs)
 br = rank_bats(raw, team_runs, allow_7th=allow_7th)
 
+# ---- EXCLUDE PLAYERS (scratches / late news) — applied before everything ----
+st.subheader("Exclude players (scratches / out)")
+st.caption("Remove anyone the tool can't see is out — late scratches, lineup news. "
+           "Dropped from the pool before ranking, constructions, and building.")
+_all_names = pr["Pitcher"].tolist() + br["Player"].tolist()
+excluded = st.multiselect("Excluded players:", options=_all_names, default=[], key="exclude")
+if excluded:
+    pr = pr[~pr["Pitcher"].isin(excluded)].reset_index(drop=True)
+    br = br[~br["Player"].isin(excluded)].reset_index(drop=True)
+
 # ---- pitcher board ----
 st.subheader("Pitchers — ranked by your gates")
 pr_show = pr.copy()
 pr_show["Tier"] = pr_show["Sal"].apply(lambda s: tier(s, PITCHER_STUD, PITCHER_VALUE))
-st.dataframe(pr_show[["Pitcher", "Tm", "OppTeam", "OppRuns", "Sal", "Tier", "RW", "SCORE", "Val",
-                 "OppG", "Qual", "Wx", "Win"]],
+st.dataframe(style_scores(pr_show[["Pitcher", "Tm", "OppTeam", "OppRuns", "Sal", "Tier", "RW", "SCORE", "Val",
+                 "OppG", "Qual", "Wx", "Win"]], ["SCORE", "OppG", "Qual", "Wx", "Win"]),
              use_container_width=True, hide_index=True)
 
 with st.expander("Why each pitcher ranks where it does"):
@@ -461,7 +592,7 @@ st.caption("Tiers: Stud ≥$9k · Mid $7–8.9k · Value <$7k. Combos with no av
 st.subheader("Bats — form leads, team total amplifies, cold bats capped")
 br_show = br.copy()
 br_show["Tier"] = br_show["Sal"].apply(lambda s: tier(s, BAT_STUD, BAT_VALUE))
-st.dataframe(br_show[["Player", "Tm", "Pos", "Slot", "Sal", "Tier", "RW", "L7", "AVG", "SCORE", "flag"]],
+st.dataframe(style_scores(br_show[["Player", "Tm", "Pos", "Slot", "Sal", "Tier", "RW", "L7", "AVG", "SCORE", "flag"]], ["SCORE"]),
              use_container_width=True, hide_index=True)
 st.caption("COLD-CAP = slumping bat held down so a hot team total can't float it up (the .180 fix).")
 
@@ -469,7 +600,7 @@ st.caption("COLD-CAP = slumping bat held down so a hot team total can't float it
 st.subheader("Lock your favorites (optional)")
 st.caption("Check any players you want in the lineup no matter what — the tool fills the rest around them.")
 all_names = pr["Pitcher"].tolist() + br["Player"].tolist()
-locked = st.multiselect("Locked players:", options=all_names, default=[])
+locked = st.multiselect("Locked players:", options=all_names, default=[], key="lock")
 
 # ---- assemble ----
 st.subheader("Built lineup")
