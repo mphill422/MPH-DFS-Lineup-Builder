@@ -90,6 +90,11 @@ COLD_AVG = 0.230               # AND below this AVG = cold -> hard cap
 COLD_CAP = 45.0                # capped score ceiling for cold bats
 SALARY_CAP = 50000
 MAX_HITTERS_PER_TEAM = 3
+# How hard the gate score moves RotoWire's projection. RotoWire already prices
+# matchup/park/weather, so the gate is a NUDGE on top, not a takeover. 0.10 = a
+# gate of 100 adds +10%, a gate of 0 subtracts 10%, gate 50 is neutral. Keep this
+# small (0.08-0.12) so RotoWire stays the backbone and the gate just breaks ties.
+GATE_MAX_SWING = 0.10
 CLOSE_CALL_PTS = 4.0
 
 # Salary tiers (Mike's numbers). stud >= STUD, value < VALUE, mid in between.
@@ -386,10 +391,12 @@ def rank_bats(df, team_runs, allow_7th=False):
 # LINEUP ASSEMBLY (salary-cap optimize on gate-adjusted score)
 # ============================================================
 def adjusted_proj(rw_fpts, gate_score):
-    """RotoWire base nudged by gate score. gate 50 = neutral (x1.0), 100 = +25%, 0 = -25%."""
+    """RotoWire base, lightly nudged by gate score. Gate 50 = neutral, 100 = +GATE_MAX_SWING,
+    0 = -GATE_MAX_SWING. Small on purpose: RotoWire already prices matchup/park/weather, so the
+    gate only tilts between similar plays instead of reordering the whole pool."""
     if rw_fpts is None:
         return 0
-    mult = 1 + (gate_score - 50) / 200.0  # 0->0.75x, 50->1.0x, 100->1.25x
+    mult = 1 + (gate_score - 50) / 50.0 * GATE_MAX_SWING
     return round(rw_fpts * mult, 2)
 
 
@@ -619,7 +626,7 @@ else:
         st.write(f"**Salary:** ${lineup['salary']:,} / ${SALARY_CAP:,}  ·  "
                  f"**Adj projection:** {lineup['proj']}")
         st.caption("BatOrd = batting order (SP for pitchers). SCORE = your gate score. "
-                   "AdjProj = RotoWire FPTS nudged ±25% by gate score. Override any spot before DK.")
+                   "AdjProj = RotoWire FPTS lightly nudged (±10%) by gate score — RotoWire stays the backbone. Override any spot before DK.")
 
 st.divider()
 st.caption("Phase 2 (next): wire Baseball Savant (xwOBA, barrel%, opp K%) + Odds API moneyline "
