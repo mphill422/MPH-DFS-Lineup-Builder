@@ -88,6 +88,13 @@ TEAM_AMP_SHARE = 0.25          # team total contributes at most this much to a n
 COLD_L7 = 6.0                  # below this L7 FPTS = cold
 COLD_AVG = 0.230               # AND below this AVG = cold -> hard cap
 COLD_CAP = 45.0                # capped score ceiling for cold bats
+# Recent form as a real signal, not just a veto. A bat can be ice-cold lately even
+# with a fine season AVG (the Loperfido/Del Castillo problem) — so L7 below the hard
+# threshold dings the score on its own. And genuinely hot bats get a modest lift.
+HARD_COLD_L7 = 4.0             # L7 this low = cold on form ALONE, regardless of AVG
+HOT_L7 = 11.0                  # L7 this high = hot; bats above get a small bump
+FORM_BUMP_MAX = 8.0            # max +pts for a red-hot bat (kept small; L7 is noisy)
+FORM_COLD_PENALTY = 8.0        # pts shaved for an ice-cold-on-form bat
 SALARY_CAP = 50000
 MAX_HITTERS_PER_TEAM = 3
 # How hard the gate score moves RotoWire's projection. RotoWire already prices
@@ -296,13 +303,28 @@ def bat_gates(r, team_runs):
                   + s_slot * BAT_INDIV_WEIGHTS["slot"], 1)
     amp = scale(tr, 3.0, 6.5)
 
+    # Cold by the strict rule (cold L7 AND low AVG) -> hard cap, as before.
     cold = (l7 is not None and l7 < COLD_L7) and (avg is not None and avg < COLD_AVG)
+    # Cold on FORM ALONE: ice-cold L7 even if season AVG looks fine. This is the
+    # Loperfido/Del Castillo fix — a guy frozen for 2 weeks shouldn't punt his way in
+    # on a decent season number. Not a hard cap, but a real penalty.
+    form_cold = (l7 is not None and l7 < HARD_COLD_L7) and not cold
+    hot = (l7 is not None and l7 >= HOT_L7) and not cold
+
     if cold:
         score = round(min(indiv, COLD_CAP) * 0.9, 1)
         flag = "COLD-CAP"
     else:
         score = round(indiv * (1 - TEAM_AMP_SHARE) + amp * TEAM_AMP_SHARE, 1)
         flag = ""
+        if form_cold:
+            score = round(max(0, score - FORM_COLD_PENALTY), 1)
+            flag = "COLD-FORM"
+        elif hot:
+            # scale the bump by how hot, capped — red-hot gets the full bump
+            bump = min(FORM_BUMP_MAX, (l7 - HOT_L7) / 7.0 * FORM_BUMP_MAX + 3.0)
+            score = round(min(100, score + bump), 1)
+            flag = "HOT"
 
     # Savant contact-quality layer: validates whether form is REAL.
     # High xwOBA/barrel% = quality contact -> small boost (hot streak is earned,
