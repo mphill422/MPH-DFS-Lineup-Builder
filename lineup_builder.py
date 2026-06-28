@@ -150,19 +150,54 @@ st.markdown("""
 
 
 def style_scores(df, score_cols):
-    """Color-code 0-100 gate columns green(high)->red(low) for fast scanning."""
+    """Color-code 0-100 gate columns on a clean green->amber->red scale that's easy to read."""
     def color(v):
         try:
             v = float(v)
         except (TypeError, ValueError):
             return ""
-        if v >= 70:
-            return "background-color: #14532d; color: #dcfce7;"
+        # brighter, legible bands with dark text for contrast
+        if v >= 80:
+            return "background-color: #16a34a; color: #ffffff; font-weight: 600;"  # strong green
+        if v >= 65:
+            return "background-color: #86efac; color: #14532d; font-weight: 600;"  # light green
         if v >= 50:
-            return "background-color: #422006; color: #fde68a;"
-        return "background-color: #450a0a; color: #fecaca;"
+            return "background-color: #fef08a; color: #713f12;"                    # yellow
+        if v >= 38:
+            return "background-color: #fdba74; color: #7c2d12;"                    # orange
+        return "background-color: #fca5a5; color: #7f1d1d;"                        # soft red
     cols = [c for c in score_cols if c in df.columns]
-    return df.style.map(color, subset=cols)
+    styler = df.style.map(color, subset=cols)
+
+    # clean number formatting: scores/salary as tidy numbers, averages at 3 decimals
+    fmt = {}
+    for c in df.columns:
+        if c in ("AVG", "xBA", "L7 AVG", "vH OPS", "OPS", "wOBA"):
+            fmt[c] = "{:.3f}"
+        elif c in ("Sal", "SAL"):
+            fmt[c] = "{:.0f}"
+        elif df[c].dtype.kind in "fc":
+            fmt[c] = "{:.1f}"
+    try:
+        styler = styler.format(fmt)
+    except Exception:
+        pass
+
+    # color the bat flags too, if present
+    if "flag" in df.columns:
+        def flag_color(val):
+            s = str(val)
+            if s == "HOT":
+                return "background-color: #fb923c; color: #ffffff; font-weight: 600;"
+            if s == "UNLUCKY":      # a BUY signal — make it green
+                return "background-color: #22c55e; color: #ffffff; font-weight: 600;"
+            if s == "LUCKY":        # caution — amber
+                return "background-color: #fde047; color: #713f12; font-weight: 600;"
+            if s in ("COLD-CAP", "COLD-FORM"):
+                return "background-color: #93c5fd; color: #1e3a8a; font-weight: 600;"
+            return ""
+        styler = styler.map(flag_color, subset=["flag"])
+    return styler
 
 
 # ============================================================
