@@ -83,18 +83,18 @@ USE_SAVANT = True
 # TUNABLES
 # ============================================================
 PITCHER_WEIGHTS = {"opponent": 0.28, "quality": 0.42, "weather": 0.15, "winprob": 0.15}
-BAT_INDIV_WEIGHTS = {"form": 0.30, "avg": 0.20, "split": 0.30, "slot": 0.20}
-TEAM_AMP_SHARE = 0.25          # team total contributes at most this much to a non-cold bat
+# New bat model: form (multi-window) + luck-adjusted quality (xBA gap) + matchup + slot.
+# Quality leads — it's the real predictive signal (is the surface line earned or lucky).
+BAT_WEIGHTS = {"form": 0.25, "quality": 0.35, "matchup": 0.20, "slot": 0.20}
+TEAM_AMP_SHARE = 0.20          # team total contributes at most this much (reduced; quality leads now)
 COLD_L7 = 6.0                  # below this L7 FPTS = cold
 COLD_AVG = 0.230               # AND below this AVG = cold -> hard cap
 COLD_CAP = 45.0                # capped score ceiling for cold bats
-# Recent form as a real signal, not just a veto. A bat can be ice-cold lately even
-# with a fine season AVG (the Loperfido/Del Castillo problem) — so L7 below the hard
-# threshold dings the score on its own. And genuinely hot bats get a modest lift.
-HARD_COLD_L7 = 4.0             # L7 this low = cold on form ALONE, regardless of AVG
-HOT_L7 = 11.0                  # L7 this high = hot; bats above get a small bump
-FORM_BUMP_MAX = 8.0            # max +pts for a red-hot bat (kept small; L7 is noisy)
-FORM_COLD_PENALTY = 8.0        # pts shaved for an ice-cold-on-form bat
+HARD_COLD_L7 = 4.0            # L7 this low = cold on form ALONE, regardless of AVG
+HOT_L7 = 11.0                 # L7 this high = hot
+FORM_BUMP_MAX = 6.0           # max +pts for red-hot (smaller now; quality does more work)
+FORM_COLD_PENALTY = 6.0
+HIGH_K_PCT = 28.0            # season K% above this = floor risk in cash -> small penalty
 SALARY_CAP = 50000
 MAX_HITTERS_PER_TEAM = 3
 # How hard the gate score moves RotoWire's projection. RotoWire already prices
@@ -237,9 +237,17 @@ def pitcher_gates(r, team_runs):
         g_opp = g_opp_runs
 
     ip, xfip, kpct = num(r.get("IP")), num(r.get("xFIP")), num(r.get("K%"))
-    g_qual = round(scale(ip, 50, 110) * 0.30
-                   + scale(xfip, 2.2, 5.2, inv=True) * 0.40
-                   + scale(kpct, 14, 32) * 0.30, 1)
+    swstr, fip = num(r.get("SwStr%")), num(r.get("FIP"))
+    # Skill blend: xFIP+FIP (true run prevention), K% + SwStr% (strikeout upside, the
+    # DFS points driver), IP (durability/volume). SwStr% is the best leading indicator
+    # of strikeouts — a pitcher missing bats will keep racking Ks even if K% lags.
+    s_xfip = scale(xfip, 2.2, 5.2, inv=True)
+    s_fip = scale(fip, 2.5, 5.5, inv=True) if fip is not None else s_xfip
+    s_k = scale(kpct, 14, 32)
+    s_swstr = scale(swstr, 8, 16) if swstr is not None else s_k
+    g_qual = round(scale(ip, 50, 110) * 0.20
+                   + s_xfip * 0.25 + s_fip * 0.15
+                   + s_k * 0.20 + s_swstr * 0.20, 1)
 
     sp, d = parse_wind(r.get("WIND"))
     precip, temp = num(r.get("PRECIP %")), num(r.get("TEMP"))
@@ -287,27 +295,52 @@ def pitcher_gates(r, team_runs):
 # BAT GATES  (form leads, team amplifies, cold capped)
 # ============================================================
 def bat_gates(r, team_runs):
-    l7, avg, vops = num(r.get("L7 FPTS")), num(r.get("AVG")), num(r.get("vH OPS"))
+    l7, l14 = num(r.get("L7 FPTS")), num(r.get("L14 FPTS"))
+    avg, vops = num(r.get("AVG")), num(r.get("vH OPS"))
+    xba = num(r.get("xBA"))
+    barrel = num(r.get("Barrel %"))
+    hard = num(r.get("Hard%"))
+    kpct = num(r.get("K%"))
     slot = str(r.get("LINEUP", "")).strip()
     t = str(r.get("TEAM", "")).strip()
     tr = team_runs.get(t)
 
-    s_form = scale(l7, 3, 18)
-    s_avg = scale(avg, 0.190, 0.320)
-    s_split = scale(vops, 0.550, 1.000)
+    # --- 1. FORM: blend L7 + L14 so it's not one noisy week ---
+    s_l7 = scale(l7, 3, 18)
+    s_l14 = scale(l14, 3, 16)
+    if l7 is not None and l14 is not None:
+        s_form = round(s_l7 * 0.6 + s_l14 * 0.4, 1)   # recent weighted, but steadied
+    else:
+        s_form = s_l7 if l7 is not None else (s_l14 if l14 is not None else 50.0)
+
+    # --- 2. QUALITY: luck-adjusted. The xBA-AVG gap is the centerpiece. ---
+    # xBA > AVG  -> unlucky, hitting into bad luck, DUE (buy).
+    # xBA < AVG  -> lucky, surface line inflated, regression coming (fade).
+    if xba is not None and avg is not None:
+        luck_gap = xba - avg                       # +0.030 unlucky, -0.030 lucky
+        s_luck = scale(luck_gap, -0.040, 0.040)    # 50 = neutral
+    else:
+        s_luck = 50.0
+    # contact quality confirms the bat is real
+    s_barrel = scale(barrel, 3, 12)
+    s_hard = scale(hard, 28, 48)
+    s_quality = round(s_luck * 0.50 + s_barrel * 0.25 + s_hard * 0.25, 1)
+
+    # --- 3. MATCHUP: vs-hand OPS ---
+    s_matchup = scale(vops, 0.550, 1.000)
+
+    # --- 4. SLOT: batting order ---
     s_slot = 100 if slot in ("1", "2", "3", "4") else (70 if slot == "5"
              else (45 if slot in ("6", "7") else 20))
-    indiv = round(s_form * BAT_INDIV_WEIGHTS["form"]
-                  + s_avg * BAT_INDIV_WEIGHTS["avg"]
-                  + s_split * BAT_INDIV_WEIGHTS["split"]
-                  + s_slot * BAT_INDIV_WEIGHTS["slot"], 1)
+
+    indiv = round(s_form * BAT_WEIGHTS["form"]
+                  + s_quality * BAT_WEIGHTS["quality"]
+                  + s_matchup * BAT_WEIGHTS["matchup"]
+                  + s_slot * BAT_WEIGHTS["slot"], 1)
     amp = scale(tr, 3.0, 6.5)
 
-    # Cold by the strict rule (cold L7 AND low AVG) -> hard cap, as before.
+    # cold/hot flags (form-based, same logic — still useful as guardrails)
     cold = (l7 is not None and l7 < COLD_L7) and (avg is not None and avg < COLD_AVG)
-    # Cold on FORM ALONE: ice-cold L7 even if season AVG looks fine. This is the
-    # Loperfido/Del Castillo fix — a guy frozen for 2 weeks shouldn't punt his way in
-    # on a decent season number. Not a hard cap, but a real penalty.
     form_cold = (l7 is not None and l7 < HARD_COLD_L7) and not cold
     hot = (l7 is not None and l7 >= HOT_L7) and not cold
 
@@ -321,42 +354,36 @@ def bat_gates(r, team_runs):
             score = round(max(0, score - FORM_COLD_PENALTY), 1)
             flag = "COLD-FORM"
         elif hot:
-            # scale the bump by how hot, capped — red-hot gets the full bump
-            bump = min(FORM_BUMP_MAX, (l7 - HOT_L7) / 7.0 * FORM_BUMP_MAX + 3.0)
+            bump = min(FORM_BUMP_MAX, (l7 - HOT_L7) / 7.0 * FORM_BUMP_MAX + 2.0)
             score = round(min(100, score + bump), 1)
             flag = "HOT"
 
-    # Savant contact-quality layer: validates whether form is REAL.
-    # High xwOBA/barrel% = quality contact -> small boost (hot streak is earned,
-    # or cold stretch is unlucky and due). Low = fade. Max ±8 pts so it sharpens,
-    # never dominates. Skipped entirely if Savant unavailable.
-    xq_why = ""
-    if USE_SAVANT and savant is not None:
-        try:
-            m = savant.player_metrics(r.get("PLAYER", ""))
-        except Exception:
-            m = {}
-        if m:
-            xwoba = m.get("xwoba")
-            barrel = m.get("barrel")
-            adj = 0.0
-            if xwoba is not None:
-                adj += (scale(xwoba, 0.280, 0.380) - 50) / 50 * 6   # ±6
-                xq_why += f" · xwOBA {xwoba:.3f}"
-            if barrel is not None:
-                adj += (scale(barrel, 4, 14) - 50) / 50 * 4         # ±4
-                xq_why += f" · barrel {barrel:.0f}%"
-            if not cold:   # don't un-cap a cold bat via contact alone
-                score = round(max(0, min(100, score + adj)), 1)
-            if adj >= 3:
-                xq_why += " (contact validates)"
-            elif adj <= -3:
-                xq_why += " (⚠ weak contact)"
+    # luck flag for transparency (independent of cold/hot)
+    if xba is not None and avg is not None:
+        if (xba - avg) >= 0.025 and not flag:
+            flag = "UNLUCKY"      # good contact, bad surface line -> buy
+        elif (xba - avg) <= -0.030 and flag in ("", "HOT"):
+            flag = "LUCKY"        # inflated line, regression risk -> caution
 
-    why = (f"L7 {l7:.1f}, AVG {avg:.3f}, vHand OPS "
-           f"{vops:.3f}, slot {slot}, team {tr:.1f} runs"
-           if all(v is not None for v in [l7, avg, vops, tr]) else "partial data")
-    why += xq_why
+    # K% floor penalty for cash (high-strikeout bats bust more often)
+    if kpct is not None and kpct >= HIGH_K_PCT and not cold:
+        score = round(max(0, score - 3.0), 1)
+
+    why_bits = []
+    if l7 is not None and l14 is not None:
+        why_bits.append(f"L7 {l7:.1f}/L14 {l14:.1f}")
+    if xba is not None and avg is not None:
+        gap = xba - avg
+        tag = "unlucky/due" if gap >= 0.025 else ("lucky/regress" if gap <= -0.030 else "fair")
+        why_bits.append(f"AVG {avg:.3f} vs xBA {xba:.3f} ({tag})")
+    if barrel is not None:
+        why_bits.append(f"barrel {barrel:.0f}%")
+    if vops is not None:
+        why_bits.append(f"vHand OPS {vops:.3f}")
+    why_bits.append(f"slot {slot}")
+    if tr is not None:
+        why_bits.append(f"team {tr:.1f}R")
+    why = ", ".join(why_bits) if why_bits else "partial data"
     return score, indiv, amp, cold, flag, why
 
 
